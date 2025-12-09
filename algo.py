@@ -27,10 +27,11 @@ class Params:
         # Concurrent extensions 
         self.batch_size = 100
         
+        # Runs until tree is this big
         self.max_tree_size = 1000
         
         # How many actions to sample when extending ONE node
-        self.num_sample_actions = 1000 # Can be a large as fits in GPU lane
+        self.num_sample_actions = 50 # Can be a large as fits in GPU lane
         self.sim_steps = 40
         
         # Debug visualization

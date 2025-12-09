@@ -11,7 +11,7 @@ def forward(params, pos, vel, action):
     new_vels = vel + action * params.dt
     new_poses = pos + new_vels * params.dt
     
-    vel *= 0.8
+    # vel *= 0.8
     
     # new_vels = action
     # new_poses = pos + new_vels * params.dt
