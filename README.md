@@ -12,6 +12,9 @@ If we can get shitty steering, then we can do kino rrt like regular rrt, where w
 ## TODO
 draw vels
 
+Next:
+- adaptive branhcing factor like kinopax
+
 ## Install and Run
 jax, numpy and matplotlib
 
