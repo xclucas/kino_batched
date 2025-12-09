@@ -7,8 +7,10 @@ If we can get shitty steering, then we can do kino rrt like regular rrt, where w
 ## TODO
 draw vels
 
-## Deps
+## Install and Run
 jax, numpy and matplotlib
+
+`python algo.py` (optional: `--viewopt` debug view)
 
 ## More notes
 The idea is, parallel operations are free (in terms of time) so we want more of those. And we want a smaller tree (less data transfer) since that's bad for the gpu. So this algorithm aims to spend more compute producing fewer but higher quality (more useful to exploration) points. 
