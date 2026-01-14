@@ -12,7 +12,7 @@ from robot import forward, metric_batch, sample, metric
 import argparse
 
 class Params:
-    def __init__(self, dt=0.1):
+    def __init__(self, dt=0.7):
         self.dt = dt
         self.dofs = 2
         
@@ -25,14 +25,14 @@ class Params:
         self.obs_data = None
 
         # Concurrent extensions 
-        self.batch_size = 100
+        self.batch_size = 50
         
         # Runs until tree is this big
-        self.max_tree_size = 1000
+        self.max_tree_size = 500
         
         # How many actions to sample when extending ONE node
-        self.num_sample_actions = 50 # Can be a large as fits in GPU lane
-        self.sim_steps = 40
+        self.num_sample_actions = 100 # Can be a large as fits in GPU lane
+        self.sim_steps = 10
         
         # Debug visualization
         self.viewopt = False
@@ -83,7 +83,7 @@ def collide(params, pos):
     return box_coll | bounds_coll
 
 
-def extend_one(params, start_state, action, goal_state):
+def extend_one(params, start_state, action, goal_state, key):
     '''
     Extend one state by one random action, for N steps
     Returns the state closest to the goal
@@ -91,11 +91,12 @@ def extend_one(params, start_state, action, goal_state):
     def extend_one_step(i, val):
         '''Extend one state for one step, tracking closest so far'''
         
-        state, nearest_distance, nearest_state = val
+        state, nearest_distance, nearest_state, key = val
         pos = state[:params.dofs]
         vel = state[params.dofs:]
         
-        new_pose, new_vel = forward(params, pos, vel, action)
+        step_key, key = jax.random.split(key)
+        new_pose, new_vel = forward(params, pos, vel, action, step_key)
         new_state = jnp.concatenate([new_pose, new_vel])
         
         # Update pos
@@ -109,22 +110,23 @@ def extend_one(params, start_state, action, goal_state):
         nearest_distance = jnp.where(new_nearest, new_distance, nearest_distance)
         nearest_state = jnp.where(new_nearest, state, nearest_state)
 
-        return state, nearest_distance, nearest_state
+        return state, nearest_distance, nearest_state, key
 
     initial_distance = metric(start_state, goal_state)
 
-    last_state, nearest_distance, nearest_state = \
-        jax.lax.fori_loop(0, params.sim_steps, extend_one_step, (start_state, initial_distance, start_state))
+    last_state, nearest_distance, nearest_state, _ = \
+        jax.lax.fori_loop(0, params.sim_steps, extend_one_step, (start_state, initial_distance, start_state, key))
         
     return nearest_distance, nearest_state
 
-def extend_one_multiple_actions(params, start_state, actions, goal_state):
+def extend_one_multiple_actions(params, start_state, actions, goal_state, key):
     '''
     Extend one state by many random actions, for N steps per action
     returns the single state closest to the goal
     '''
-    extend_one_vmap = jax.vmap(extend_one, in_axes=(None, None, 0, None))
-    closest_distances, closest_states = extend_one_vmap(params, start_state, actions, goal_state)
+    keys = jax.random.split(key, actions.shape[0])
+    extend_one_vmap = jax.vmap(extend_one, in_axes=(None, None, 0, None, 0))
+    closest_distances, closest_states = extend_one_vmap(params, start_state, actions, goal_state, keys)
         
     best_index = jnp.argmin(closest_distances)
     return closest_states[best_index] 
@@ -143,7 +145,9 @@ def voronoi_kino(params, key, tree, tree_len):
         # nonlocal targets
         key, tree, tree_len = items
         
-        targets = sample(params, key, params.batch_size)
+        key, sample_key, action_key, extend_key = jax.random.split(key, 4)
+        
+        targets = sample(params, sample_key, params.batch_size)
         target_poses = targets
         
         # # Get non colliding targets
@@ -167,18 +171,17 @@ def voronoi_kino(params, key, tree, tree_len):
         # target_poses = targets[target_indices]
        
         # Actions for EACH node
-        actions = jax.random.uniform(key, (params.num_sample_actions, params.dofs), minval=params.action_min, maxval=params.action_max)
-        extend_many = jax.vmap(extend_one_multiple_actions, in_axes=(None, 0, None, 0))
-        closest_states = extend_many(params, extend_states, actions, target_poses)
+        actions = jax.random.uniform(action_key, (params.num_sample_actions, params.dofs), minval=params.action_min, maxval=params.action_max)
+        
+        batch_keys = jax.random.split(extend_key, extend_states.shape[0])
+        extend_many = jax.vmap(extend_one_multiple_actions, in_axes=(None, 0, None, 0, 0))
+        closest_states = extend_many(params, extend_states, actions, target_poses, batch_keys)
                 
         # Add to tree (closest_poses and closest_vels)
         add_idx = tree_len + jnp.arange(closest_states.shape[0])
         tree = tree.at[add_idx, :dofs2].set(closest_states)
         tree = tree.at[add_idx, -1].set(pose_indices)
         tree_len += closest_states.shape[0]
-        
-        # New key
-        new_key, _ = jax.random.split(key)
         
         if params.viewopt:
             def callback(tree, tree_idx, target_poses):
@@ -192,11 +195,11 @@ def voronoi_kino(params, key, tree, tree_len):
             
             jax.debug.callback(callback, tree, add_idx, target_poses)
 
-        return new_key, tree, tree_len
+        return key, tree, tree_len
     
     def cond(items):
         key, tree, tree_len = items
-        return tree_len + params.batch_size < params.max_tree_size
+        return tree_len + params.batch_size <= params.max_tree_size
     
     # Run 20 steps
     key, tree, tree_len = \
@@ -294,12 +297,21 @@ if __name__ == "__main__":
     key = jax.random.key(seed)
     
     # Warmup
-    voronoi_kino_star(params, start_state, key)
+    if not params.viewopt:
+        voronoi_kino_star(params, start_state, key)
     
     start_time = time.perf_counter()
+    # with jax.profiler.trace("/tmp/jax-trace", create_perfetto_link=True):
     voronoi_kino_star(params, start_state, key)
     time_ms = (time.perf_counter() - start_time) * 1000
     print(f"Planning took {time_ms :.2f} ms")
     
-    # Show the final tree
-    time.sleep(1000)
+    if params.viewopt:
+        # Show the final tree
+        plt.savefig('planning_result.png')
+        time.sleep(1000)
+    else:
+        # FIXME doesnt work
+        params.viewopt = True
+        voronoi_kino_star(params, start_state, key)
+        plt.savefig('planning_result.png')

@@ -7,7 +7,7 @@ class RectangleEnv:
     A 2D motion planning environment with rectangular obstacles.
     """
 
-    def __init__(self, width=50, height=50, num_obstacles=10, seed=None):
+    def __init__(self, width=50, height=50, num_obstacles=32, seed=None):
         self.width = width
         self.height = height
         self.num_obstacles = num_obstacles
@@ -20,8 +20,8 @@ class RectangleEnv:
 
         for _ in range(self.num_obstacles):
             while True:
-                width = np.random.uniform(6, 13)
-                height = np.random.uniform(6, 13)
+                width = np.random.uniform(3, 5)
+                height = np.random.uniform(3, 5)
                 x = np.random.uniform(-width, self.width)
                 y = np.random.uniform(-height, self.height)
                 

@@ -3,13 +3,16 @@ from dataclasses import dataclass
 import jax
 import jax.numpy as jnp
 
-def forward(params, pos, vel, action):
+def forward(params, pos, vel, action, key):
     assert pos.shape == (params.dofs,)
     assert vel.shape == (params.dofs,)
     assert action.shape == (params.dofs,)
     
-    new_vels = vel + action * params.dt
-    new_poses = pos + new_vels * params.dt
+    # dt = jax.random.uniform(key, minval=0.0, maxval=params.dt)
+    dt = params.dt
+    
+    new_vels = vel + action * dt
+    new_poses = pos + new_vels * dt
     
     # vel *= 0.8
     
