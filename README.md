@@ -4,8 +4,16 @@ chance we end up where we want to go. But with batching, we can sample N random 
 
 If we can get shitty steering, then we can do kino rrt like regular rrt, where we sample a random point and try to go there. Then there is a voronoi bias and also a guarantee of complete exploration.
 
+## Experimental results
+- bottleneck is sequentialism: you need a certain numbers of tree expansions for good exploration (related to visiblity of space), can't get to goal in one step
+- bottleneck is NOT sampling - we can increase the batch size until diminishing returns, we still have plenty of bandwith for better and badder sampling
+
+
 ## TODO
 draw vels
+
+Next:
+- adaptive branhcing factor like kinopax
 
 ## Install and Run
 jax, numpy and matplotlib
