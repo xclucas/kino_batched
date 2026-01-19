@@ -270,26 +270,34 @@ def reverse_tree(robot, vis_callback, params, key, tree, tree_len):
         final_dists = robot.metric(sim_endpoints, target_states)
         valid_extensions = final_dists < params.reverse_distance_threshold
         
-        # Pack valid items to the front using Top-K (Gather is faster than Scatter)
+        # Pack valid items to the front using Cumsum (Scatter)
         num_valid = jnp.sum(valid_extensions).astype(jnp.int32)
-        _, sort_ids = jax.lax.top_k(valid_extensions.astype(jnp.int32), k=params.batch_size)
         
-        sorted_states = samples[sort_ids] # The valid samples are now at the top
-        sorted_parents = pose_indices[sort_ids]
+        # 1. Calculate scatter indices for permutation
+        idx_valid = jnp.cumsum(valid_extensions) - 1
+        idx_invalid = num_valid + jnp.cumsum(~valid_extensions) - 1
+        
+        scatter_indices = jnp.where(valid_extensions, idx_valid, idx_invalid)
+        
+        # 2. Scatter to pack
+        # We start with empty arrays and scatter 'samples' and 'pose_indices' into them
+        packed_states = jnp.zeros_like(samples).at[scatter_indices].set(samples)
+        packed_parents = jnp.zeros_like(pose_indices).at[scatter_indices].set(pose_indices)
         
         # Create dense block for tree update
         # [state, parent_idx] packed
-        sorted_parents_f = sorted_parents.astype(tree.dtype)[:, None]
-        update_block = jnp.concatenate([sorted_states, sorted_parents_f], axis=1)
+        packed_parents_f = packed_parents.astype(tree.dtype)[:, None]
+        update_block = jnp.concatenate([packed_states, packed_parents_f], axis=1)
         
         # Write entire batch (valid + garbage tail) to tree
         tree = jax.lax.dynamic_update_slice(tree, update_block, (tree_len, 0))
         
         if params.viewopt:
              # Mask invalid tail with NaNs for visualization to avoid drawing garbage
-             sorted_mask = valid_extensions[sort_ids]
-             vis_states = jnp.where(sorted_mask[:, None], sorted_states, jnp.nan)
-             vis_parent_states = tree[sorted_parents, :state_dim]
+             # valid items are packed into [0, num_valid)
+             pack_mask = jnp.arange(params.batch_size) < num_valid
+             vis_states = jnp.where(pack_mask[:, None], packed_states, jnp.nan)
+             vis_parent_states = tree[packed_parents, :state_dim]
              
              jax.debug.callback(vis_callback, vis_states, vis_parent_states, samples, tree_len)
 
