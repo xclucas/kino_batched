@@ -2,7 +2,7 @@ kinodynamic rrt is bad at exploring because we have to randomly sample actions a
 chance we end up where we want to go. But with batching, we can sample N random actions together
 (like a 1000 actions) and take the best one (without taking much longer). So that makes it possible to steer a bit.
 
-If we can get shitty steering, then we can do kino rrt like regular rrt, where we sample a random point and try to go there. Then there is a voronoi bias and also a guarantee of complete exploration.
+If we can get shitty steering, then we can do kino rrt like regular rrt, where we sample a random point and try to go there. Then there is a voronoi bias and also a guarantee of complete exploration. We actually want to throw away bad samples because tree search time is very important -- less and higher quality samples is good
 
 ## Experimental results
 - bottleneck is sequentialism: you need a certain numbers of tree expansions for good exploration (related to visiblity of space), can't get to goal in one step
@@ -10,7 +10,10 @@ If we can get shitty steering, then we can do kino rrt like regular rrt, where w
 
 
 ## TODO
-draw vels
+More environments
+More benchmark statistics
+Bidirectional tree
+MAB for tree growth, where nodes are arms
 
 Next:
 - adaptive branhcing factor like kinopax
