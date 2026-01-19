@@ -106,10 +106,10 @@ def sample(params, key, batch_size):
 def extend_one(robot, params, start_state, action, goal_state, key):
     '''
     Extend one state by one random action, for N steps
-    Returns the state closest to the goal
+    Returns the state closest to the goal, and the number of steps forward that were valid
     '''
     def extend_one_step(i, val):
-        state, nearest_distance, nearest_state, key = val
+        state, nearest_distance, nearest_state, nearest_step, key = val
 
         # FIXME in the past we had random dt
         new_state = robot.forward(params, state, action, params.dt)
@@ -122,20 +122,23 @@ def extend_one(robot, params, start_state, action, goal_state, key):
 
         nearest_distance = jnp.where(new_nearest, new_distance, nearest_distance)
         nearest_state = jnp.where(new_nearest, state, nearest_state)
+        # i goes 0..steps-1. This is the (i+1)-th state in the sequence
+        nearest_step = jnp.where(new_nearest, i + 1, nearest_step)
 
-        return state, nearest_distance, nearest_state, key
+        return state, nearest_distance, nearest_state, nearest_step, key
 
     initial_distance = robot.metric(start_state, goal_state)
 
-    last_state, nearest_distance, nearest_state, _ = \
-        jax.lax.fori_loop(0, params.sim_steps, extend_one_step, (start_state, initial_distance, start_state, key))
+    # Initial step is 0
+    last_state, nearest_distance, nearest_state, nearest_step, _ = \
+        jax.lax.fori_loop(0, params.sim_steps, extend_one_step, (start_state, initial_distance, start_state, 0, key))
         
-    return nearest_distance, nearest_state
+    return nearest_distance, nearest_state, nearest_step
 
 def extend_one_multiple_actions(robot, params, start_state, goal_state, key):
     '''
     Extend one state by many random actions, for N steps per action
-    returns the single state closest to the goal
+    returns the single state closest to the goal, the action used, and the elapsed time
     '''
     # Sample actions
     # Split key explicitly for sampling vs vmap
@@ -149,16 +152,82 @@ def extend_one_multiple_actions(robot, params, start_state, goal_state, key):
     extend_one_fn = partial(extend_one, robot)
     extend_one_vmap = jax.vmap(extend_one_fn, in_axes=(None, None, 0, None, 0))
     
-    closest_distances, closest_states = extend_one_vmap(params, start_state, actions, goal_state, keys)
+    closest_distances, closest_states, closest_steps = extend_one_vmap(params, start_state, actions, goal_state, keys)
     
     # Pick best action
     best_index = jnp.argmin(closest_distances)
-    return closest_states[best_index]
+    return closest_states[best_index], actions[best_index], closest_steps[best_index]
+
+def reverse_extend_one(robot, params, start_state, action, goal_state, key):
+    '''
+    Extend one state backwards by one random action, for N steps
+    Note! This extends from 'start_state' backwards towards 'goal_state', so note
+    the argument order.
+    returns the state closest to goal_state.
+    '''
+    def extend_one_step(i, val):
+        state, nearest_distance, nearest_state, nearest_step, key = val
+
+        # Backward Euler integration approximation
+        # Estimate gradients wrt time to get velocity vector
+        # x_prev = x - x_dot * dt
+        def forward_t(t):
+            return robot.forward(params, state, action, t)
+            
+        # Use JVP to get derivative d(forward)/dt
+        _, x_dot = jax.jvp(forward_t, (0.0,), (1.0,))
+        
+        delta = x_dot * params.dt
+        new_state = state - delta
+        
+        # Check collision for the segment (order shouldn't matter for static obs)
+        did_collide = robot.collide(params, new_state, state)
+        state = jnp.where(did_collide, state, new_state)
+
+        # Update nearest
+        new_distance = robot.metric(state, goal_state)
+        new_nearest = new_distance < nearest_distance
+
+        nearest_distance = jnp.where(new_nearest, new_distance, nearest_distance)
+        nearest_state = jnp.where(new_nearest, state, nearest_state)
+        nearest_step = jnp.where(new_nearest, i + 1, nearest_step)
+
+        return state, nearest_distance, nearest_state, nearest_step, key
+
+    initial_distance = robot.metric(start_state, goal_state)
+
+    last_state, nearest_distance, nearest_state, nearest_step, _ = \
+        jax.lax.fori_loop(0, params.sim_steps, extend_one_step, (start_state, initial_distance, start_state, 0, key))
+        
+    return nearest_distance, nearest_state, nearest_step
+
+def reverse_extend_one_multiple_actions(robot, params, start_state, goal_state, key):
+    '''
+    Extend one state by many random actions, for N steps per action
+    returns the single state closest to the goal, the action used, and elapsed time
+    '''
+    # Sample actions
+    # Split key explicitly for sampling vs vmap
+    sample_key, key = jax.random.split(key)
+    
+    actions = jax.random.uniform(sample_key, (params.num_sample_actions, params.action_dim), minval=params.action_min, maxval=params.action_max)
+    
+    keys = jax.random.split(key, params.num_sample_actions)
+    
+    # Exclude robot from arglist
+    extend_one_fn = partial(reverse_extend_one, robot)
+    extend_one_vmap = jax.vmap(extend_one_fn, in_axes=(None, None, 0, None, 0))
+    
+    closest_distances, closest_states, closest_steps = extend_one_vmap(params, start_state, actions, goal_state, keys)
+    
+    # Pick best action
+    best_index = jnp.argmin(closest_distances)
+    return closest_states[best_index], actions[best_index], closest_steps[best_index]
 
 @partial(jax.jit, static_argnames=['robot', 'vis_callback', 'params'])
 def forward_tree(robot, vis_callback, params, key, tree, tree_len):
     '''
-    Creates an expands a tree until it reaches max_tree_size
+    Expands a tree outwards until it reaches max_tree_size
     Returns (key, tree, tree_len)
     '''
     def step(items):
@@ -189,7 +258,7 @@ def forward_tree(robot, vis_callback, params, key, tree, tree_len):
         batch_keys = jax.random.split(extend_key, params.batch_size)
         
         extend_many = jax.vmap(extend_one_multiple_actions, in_axes=(None, None, 0, 0, 0))
-        new_states = extend_many(robot, params, origin_states, targets, batch_keys)
+        new_states, new_actions, new_elapsed_steps = extend_many(robot, params, origin_states, targets, batch_keys)
                 
         # Check collision again? extend_one already returns valid states (or start state).
         # We assume extend_one logic ensures validity.
@@ -198,13 +267,14 @@ def forward_tree(robot, vis_callback, params, key, tree, tree_len):
         add_idx = tree_len + jnp.arange(params.batch_size)
                 
         tree = tree.at[add_idx, :state_dim].set(new_states)
+        tree = tree.at[add_idx, state_dim:state_dim+params.action_dim].set(new_actions)
         tree = tree.at[add_idx, -1].set(pose_indices)
         
         if params.viewopt:
-             # Extract parent states for visualization
-             parent_states = tree[pose_indices, :state_dim]
-             jax.debug.callback(vis_callback, new_states, parent_states, targets, tree_len)
-
+            # Extract parent states for visualization
+            parent_states = tree[pose_indices, :state_dim]
+            jax.debug.callback(vis_callback, new_states, parent_states, new_actions, new_elapsed_steps, targets, tree_len, "forward")
+        
         tree_len += params.batch_size
 
         return key, tree, tree_len
@@ -222,86 +292,56 @@ def forward_tree(robot, vis_callback, params, key, tree, tree_len):
 @partial(jax.jit, static_argnames=['robot', 'vis_callback', 'params'])
 def reverse_tree(robot, vis_callback, params, key, tree, tree_len):
     '''
-    Creates and expands a tree from goal backwards
+    Expands a tree outwards and backwards until it reaches max_tree_size
+    Returns (key, tree, tree_len)
     '''
     def step(items):
         key, tree, tree_len = items
         state_dim = params.state_dim
-        
+
         key, sample_key, extend_key = jax.random.split(key, 3)
         
-        # Sample NEW candidate nodes (targets in forward_tree sense, but here they are Starts of simulation)
+        # Sample targets
         samples = sample(params, sample_key, params.batch_size)
         
         # Get closest tree node for each sample
         # tree: [MAX, state_dim + 1]
         tree_states = tree[:, :state_dim]
-        tree_parents = tree[:, -1]
         
-        # Metric: samples(B, S), tree(T, S)
+        # Vectorized metric: samples(B, S), tree(T, S)
         # Broadcast: (B, 1, S), (1, T, S)
         distances = robot.metric(samples[:, None, :], tree_states[None, :, :])
         
-        # Mask invalid tree nodes (outside len, or garbage marked with -2)
-        # Root has parent -1, so it is valid
-        is_node_valid = (jnp.arange(tree.shape[0]) < tree_len) & (tree_parents != -2)
-        
-        # (B, T)
-        distances = jnp.where(is_node_valid[None, :], distances, jnp.inf)
+        # Mask invalid tree nodes
+        tree_valid = jnp.arange(tree.shape[0]) < tree_len
+        distances = jnp.where(tree_valid, distances, jnp.inf)
         
         pose_indices = jnp.argmin(distances, axis=1) # (B,) indices of closest tree nodes
-        target_states = tree[pose_indices, :state_dim] # We drive TOWARDS the tree
+        origin_states = tree[pose_indices, :state_dim]
         
-        # Clamp samples to be within max_sample_from_distance
-        min_dists = distances[jnp.arange(params.batch_size), pose_indices]
-        scale = jnp.minimum(1.0, params.max_sample_from_distance / (min_dists + 1e-6))
-        samples = target_states + (samples - target_states) * scale[:, None]
-        
-        # Extend from 'samples' TOWARDS 'target_states'
+        # Actions for EACH node
         batch_keys = jax.random.split(extend_key, params.batch_size)
-        extend_many = jax.vmap(extend_one_multiple_actions, in_axes=(None, None, 0, 0, 0))
         
-        # forward_tree: origin -> new (towards target)
-        # reverse_tree: sample -> new (towards tree_node)
-        sim_endpoints = extend_many(robot, params, samples, target_states, batch_keys) 
+        # Use REVERSE extension
+        extend_many = jax.vmap(reverse_extend_one_multiple_actions, in_axes=(None, None, 0, 0, 0))
+        new_states, new_actions, new_elapsed_steps = extend_many(robot, params, origin_states, samples, batch_keys)
+                
+        # Check collision again? extend_one already returns valid states (or start state).
+        # We assume extend_one logic ensures validity.
         
-        # Validate connections
-        # Distance from sim_endpoint (closest point on traj to tree node) to tree node should be small
-        final_dists = robot.metric(sim_endpoints, target_states)
-        valid_extensions = final_dists < params.reverse_distance_threshold
-        
-        # Pack valid items to the front using Cumsum (Scatter)
-        num_valid = jnp.sum(valid_extensions).astype(jnp.int32)
-        
-        # 1. Calculate scatter indices for permutation
-        idx_valid = jnp.cumsum(valid_extensions) - 1
-        idx_invalid = num_valid + jnp.cumsum(~valid_extensions) - 1
-        
-        scatter_indices = jnp.where(valid_extensions, idx_valid, idx_invalid)
-        
-        # 2. Scatter to pack
-        # We start with empty arrays and scatter 'samples' and 'pose_indices' into them
-        packed_states = jnp.zeros_like(samples).at[scatter_indices].set(samples)
-        packed_parents = jnp.zeros_like(pose_indices).at[scatter_indices].set(pose_indices)
-        
-        # Create dense block for tree update
-        # [state, parent_idx] packed
-        packed_parents_f = packed_parents.astype(tree.dtype)[:, None]
-        update_block = jnp.concatenate([packed_states, packed_parents_f], axis=1)
-        
-        # Write entire batch (valid + garbage tail) to tree
-        tree = jax.lax.dynamic_update_slice(tree, update_block, (tree_len, 0))
+        # Add to tree
+        add_idx = tree_len + jnp.arange(params.batch_size)
+                
+        tree = tree.at[add_idx, :state_dim].set(new_states)
+        tree = tree.at[add_idx, state_dim:state_dim+params.action_dim].set(new_actions) # Store actions
+        tree = tree.at[add_idx, -1].set(pose_indices)
         
         if params.viewopt:
-             # Mask invalid tail with NaNs for visualization to avoid drawing garbage
-             # valid items are packed into [0, num_valid)
-             pack_mask = jnp.arange(params.batch_size) < num_valid
-             vis_states = jnp.where(pack_mask[:, None], packed_states, jnp.nan)
-             vis_parent_states = tree[packed_parents, :state_dim]
-             
-             jax.debug.callback(vis_callback, vis_states, vis_parent_states, samples, tree_len)
+            # Extract parent states for visualization
+            parent_states = tree[pose_indices, :state_dim]
+            jax.debug.callback(vis_callback, new_states, parent_states, new_actions, new_elapsed_steps, samples, tree_len, "reverse")
 
-        tree_len += num_valid
+        tree_len += params.batch_size
 
         return key, tree, tree_len
     
@@ -316,9 +356,9 @@ def reverse_tree(robot, vis_callback, params, key, tree, tree_len):
     return key, tree, tree_len
 
 def init_tree(params, start_state):
-    # Tree is [max_tree_size, state_dim + 1]
-    # Which holds [:, state + parent_index]
-    tree = jnp.zeros((params.max_tree_size, params.state_dim + 1))
+    # Tree is [max_tree_size, state_dim + action_dim + 1]
+    # Which holds [:, state + action + parent_index]
+    tree = jnp.zeros((params.max_tree_size, params.state_dim + params.action_dim + 1))
     tree_len = 0
     
     tree = tree.at[0, :params.state_dim].set(start_state)
@@ -358,8 +398,8 @@ if __name__ == "__main__":
         robot_module.draw_robot(vis, params.goal, color=0xff0000, name="goal")
 
 
-    def vis_callback(new_states, parent_states, targets, tree_len):
-        draw.draw_edges(parent_states, new_states, tree_len, robot_module)
+    def vis_callback(new_states, parent_states, actions, elapsed_steps, targets, tree_len, mode):
+        draw.draw_edges(parent_states, new_states, actions, elapsed_steps, tree_len, mode, params, robot_module)
         draw.draw_targets(targets, robot_module)
 
     # FIXME we incur a penalty to copy this to gpu, in the

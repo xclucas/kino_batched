@@ -10,10 +10,10 @@ If we can get shitty steering, then we can do kino rrt like regular rrt, where w
 
 
 ## TODO
-More environments
 More benchmark statistics
 Bidirectional tree
 MAB for tree growth, where nodes are arms
+dynamic_update_slice to replace arange(), benchmark
 
 Next:
 - adaptive branhcing factor like kinopax
