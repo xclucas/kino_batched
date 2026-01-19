@@ -270,23 +270,30 @@ def reverse_tree(robot, vis_callback, params, key, tree, tree_len):
         final_dists = robot.metric(sim_endpoints, target_states)
         valid_extensions = final_dists < params.reverse_distance_threshold
         
-        # Apply mask
-        # If valid, we add the START of the simulation (samples) to the tree
-        new_states = jnp.where(valid_extensions[:, None], samples, jnp.nan)
-        new_parents = jnp.where(valid_extensions, pose_indices, -2)
+        # Pack valid items to the front using Top-K (Gather is faster than Scatter)
+        num_valid = jnp.sum(valid_extensions).astype(jnp.int32)
+        _, sort_ids = jax.lax.top_k(valid_extensions.astype(jnp.int32), k=params.batch_size)
         
-        # Add to tree
-        add_idx = tree_len + jnp.arange(params.batch_size)
-                
-        tree = tree.at[add_idx, :state_dim].set(new_states)
-        tree = tree.at[add_idx, -1].set(new_parents)
+        sorted_states = samples[sort_ids] # The valid samples are now at the top
+        sorted_parents = pose_indices[sort_ids]
+        
+        # Create dense block for tree update
+        # [state, parent_idx] packed
+        sorted_parents_f = sorted_parents.astype(tree.dtype)[:, None]
+        update_block = jnp.concatenate([sorted_states, sorted_parents_f], axis=1)
+        
+        # Write entire batch (valid + garbage tail) to tree
+        tree = jax.lax.dynamic_update_slice(tree, update_block, (tree_len, 0))
         
         if params.viewopt:
-             # Extract parent states for visualization
-             parent_states = tree[pose_indices, :state_dim]
-             jax.debug.callback(vis_callback, new_states, parent_states, samples, tree_len)
+             # Mask invalid tail with NaNs for visualization to avoid drawing garbage
+             sorted_mask = valid_extensions[sort_ids]
+             vis_states = jnp.where(sorted_mask[:, None], sorted_states, jnp.nan)
+             vis_parent_states = tree[sorted_parents, :state_dim]
+             
+             jax.debug.callback(vis_callback, vis_states, vis_parent_states, samples, tree_len)
 
-        tree_len += params.batch_size
+        tree_len += num_valid
 
         return key, tree, tree_len
     
