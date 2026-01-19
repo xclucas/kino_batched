@@ -43,19 +43,19 @@ def forward(params, state, action, dt):
     
     return jnp.array([next_x, next_y, next_theta, next_v])
 
-def collide(params, state):
+def collide(params, old_state, new_state):
     # state: (4,)
-    pos = state[:DOFS] # x, y
+    old_pos = old_state[:DOFS] # x, y
+    new_pos = new_state[:DOFS] # x, y
     
     # Bounds check (using STATE_MIN/MAX)
     # Check x, y, v against limits?
     # Usually collision only checks position bounds.
     # But let's check basic bounds.
-    bounds_coll = jnp.any((state < params.state_min) | (state > params.state_max))
+    bounds_coll = jnp.any((new_state < params.state_min) | (new_state > params.state_max))
 
     # Obstacle check
-    p3 = jnp.array([pos[0], pos[1], 0.0])
-    is_free = params.collide_fn(p3, params.obs_data)
+    is_free = params.collide_fn(old_pos, new_pos, params.obs_data)
     
     return bounds_coll | (~is_free)
 

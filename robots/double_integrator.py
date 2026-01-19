@@ -36,19 +36,21 @@ def forward(params, state, action, dt):
     
     return jnp.concatenate([new_pos, new_vel])
 
-def collide(params, state):
-    pos = state[:DOFS]
+def collide(params, old_state, new_state):
+    old_pos = old_state[:DOFS]
+    new_pos = new_state[:DOFS]
     
-    bounds_coll = jnp.any((state < params.state_min) | (state > params.state_max))
+    # Only check new_state, as old_state is assumed valid from the last collide() check
+    # and the base case (start and goal state) are assumed valid
+    bounds_coll = jnp.any((new_state < params.state_min) | (new_state > params.state_max))
 
-    is_free = params.collide_fn(pos, params.obs_data)
+    is_free = params.collide_fn(old_pos, new_pos, params.obs_data)
     
     return bounds_coll | (~is_free)
 
 def metric(states, goal_states):
-    dofs = DOFS
-    pos_diff = states[..., :dofs] - goal_states[..., :dofs]
-    vel_diff = states[..., dofs:] - goal_states[..., dofs:]
+    pos_diff = states[..., :DOFS] - goal_states[..., :DOFS]
+    vel_diff = states[..., DOFS:] - goal_states[..., DOFS:]
     return jnp.linalg.norm(pos_diff, axis=-1) + 0.1 * jnp.linalg.norm(vel_diff, axis=-1)
 
 def draw_robot(vis, state, color=0x0000ff, name="double_integrator"):

@@ -66,12 +66,15 @@ def forward(params, state, action, dt):
     
     return jnp.array([nx, ny, nz, nyaw, npitch, nv])
 
-def collide(params, state):
-    pos = state[:3] # x,y,z
+def collide(params, old_state, new_state):
+    old_pos = old_state[:3] # x,y,z
+    new_pos = new_state[:3]
     
-    bounds_coll = jnp.any((state < params.state_min) | (state > params.state_max))
+    # Only check new_state, as old_state is assumed valid from the last collide() check
+    # and the base case (start and goal state) are assumed valid
+    bounds_coll = jnp.any((new_state < params.state_min) | (new_state > params.state_max))
 
-    is_free = params.collide_fn(pos, params.obs_data)
+    is_free = params.collide_fn(old_pos, new_pos, params.obs_data)
     
     return bounds_coll | (~is_free)
 

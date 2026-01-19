@@ -19,20 +19,27 @@ ROBOTS = {
 # Global vis instance
 vis = None
 
-def collide_fn(p1, obstacles):
-    # p1: (3,)
+def collide_fn(p1, p2, obstacles):
+    # p1, p2: (3,)
     # obstacles: (N, 6)
-    assert p1.shape[0] == 3
+    assert p1.shape == (3,)
+    assert p2.shape == (3,)
     
-    # obstacles (N, 6)
+    # Bounding box of the movement
+    p_min = jnp.minimum(p1, p2)
+    p_max = jnp.maximum(p1, p2)
+    
     obs_min = obstacles[:, :3]
     obs_max = obstacles[:, 3:6]
     
-    # Check if point is INSIDE any obstacle
-    # (N,) boolean
-    inside = jnp.all((p1 >= obs_min) & (p1 <= obs_max), axis=1)
+    # Check intersection of AABBs
+    # p_min <= obs_max AND obs_min <= p_max
+    overlap = jnp.all((p_max >= obs_min) & (p_min <= obs_max), axis=1)
+    
+    # TODO in the future we may account for robot radius, but kinopax doesn't 
+    # do that so we won't either
         
-    return ~jnp.any(inside)
+    return ~jnp.any(overlap)
 
 class Params:
     def __init__(self, robot_module, obs_file):
@@ -51,6 +58,11 @@ class Params:
         self.num_sample_actions = 100 # Can be a large as fits in GPU lane
         self.sim_steps = 10 # Steps per extension
         
+        # Reverse tree extensions need to be this close to count
+        self.reverse_distance_threshold = 0.5
+        # If we sample far away, we clamp the sample to this distance for the extension attempt
+        self.max_sample_from_distance = 2.0
+
         self.viewopt = False
         
         self.dofs = robot_module.DOFS
@@ -81,8 +93,8 @@ class Params:
         assert jnp.all((self.start >= self.state_min) & (self.start <= self.state_max)), "Start state out of bounds"
         assert jnp.all((self.goal >= self.state_min) & (self.goal <= self.state_max)), "Goal state out of bounds"
         
-        assert robot_module.collide(self, self.start) == False, "Start state in collision"
-        assert robot_module.collide(self, self.goal) == False, "Goal state in collision"
+        assert robot_module.collide(self, self.start, self.start) == False, "Start state in collision"
+        assert robot_module.collide(self, self.goal, self.goal) == False, "Goal state in collision"
 
 def sample(params, key, batch_size):
     '''
@@ -101,7 +113,7 @@ def extend_one(robot, params, start_state, action, goal_state, key):
 
         # FIXME in the past we had random dt
         new_state = robot.forward(params, state, action, params.dt)
-        did_collide = robot.collide(params, new_state)
+        did_collide = robot.collide(params, state, new_state)
         state = jnp.where(did_collide, state, new_state)
 
         # Update nearest
@@ -144,7 +156,7 @@ def extend_one_multiple_actions(robot, params, start_state, goal_state, key):
     return closest_states[best_index]
 
 @partial(jax.jit, static_argnames=['robot', 'vis_callback', 'params'])
-def voronoi_kino(robot, vis_callback, params, key, tree, tree_len):
+def forward_tree(robot, vis_callback, params, key, tree, tree_len):
     '''
     Creates an expands a tree until it reaches max_tree_size
     Returns (key, tree, tree_len)
@@ -206,7 +218,88 @@ def voronoi_kino(robot, vis_callback, params, key, tree, tree_len):
         jax.lax.while_loop(cond, step, (key, tree, tree_len))
         
     return key, tree, tree_len
+
+@partial(jax.jit, static_argnames=['robot', 'vis_callback', 'params'])
+def reverse_tree(robot, vis_callback, params, key, tree, tree_len):
+    '''
+    Creates and expands a tree from goal backwards
+    '''
+    def step(items):
+        key, tree, tree_len = items
+        state_dim = params.state_dim
         
+        key, sample_key, extend_key = jax.random.split(key, 3)
+        
+        # Sample NEW candidate nodes (targets in forward_tree sense, but here they are Starts of simulation)
+        samples = sample(params, sample_key, params.batch_size)
+        
+        # Get closest tree node for each sample
+        # tree: [MAX, state_dim + 1]
+        tree_states = tree[:, :state_dim]
+        tree_parents = tree[:, -1]
+        
+        # Metric: samples(B, S), tree(T, S)
+        # Broadcast: (B, 1, S), (1, T, S)
+        distances = robot.metric(samples[:, None, :], tree_states[None, :, :])
+        
+        # Mask invalid tree nodes (outside len, or garbage marked with -2)
+        # Root has parent -1, so it is valid
+        is_node_valid = (jnp.arange(tree.shape[0]) < tree_len) & (tree_parents != -2)
+        
+        # (B, T)
+        distances = jnp.where(is_node_valid[None, :], distances, jnp.inf)
+        
+        pose_indices = jnp.argmin(distances, axis=1) # (B,) indices of closest tree nodes
+        target_states = tree[pose_indices, :state_dim] # We drive TOWARDS the tree
+        
+        # Clamp samples to be within max_sample_from_distance
+        min_dists = distances[jnp.arange(params.batch_size), pose_indices]
+        scale = jnp.minimum(1.0, params.max_sample_from_distance / (min_dists + 1e-6))
+        samples = target_states + (samples - target_states) * scale[:, None]
+        
+        # Extend from 'samples' TOWARDS 'target_states'
+        batch_keys = jax.random.split(extend_key, params.batch_size)
+        extend_many = jax.vmap(extend_one_multiple_actions, in_axes=(None, None, 0, 0, 0))
+        
+        # forward_tree: origin -> new (towards target)
+        # reverse_tree: sample -> new (towards tree_node)
+        sim_endpoints = extend_many(robot, params, samples, target_states, batch_keys) 
+        
+        # Validate connections
+        # Distance from sim_endpoint (closest point on traj to tree node) to tree node should be small
+        final_dists = robot.metric(sim_endpoints, target_states)
+        valid_extensions = final_dists < params.reverse_distance_threshold
+        
+        # Apply mask
+        # If valid, we add the START of the simulation (samples) to the tree
+        new_states = jnp.where(valid_extensions[:, None], samples, jnp.nan)
+        new_parents = jnp.where(valid_extensions, pose_indices, -2)
+        
+        # Add to tree
+        add_idx = tree_len + jnp.arange(params.batch_size)
+                
+        tree = tree.at[add_idx, :state_dim].set(new_states)
+        tree = tree.at[add_idx, -1].set(new_parents)
+        
+        if params.viewopt:
+             # Extract parent states for visualization
+             parent_states = tree[pose_indices, :state_dim]
+             jax.debug.callback(vis_callback, new_states, parent_states, samples, tree_len)
+
+        tree_len += params.batch_size
+
+        return key, tree, tree_len
+    
+    def cond(items):
+        key, tree, tree_len = items
+        return tree_len + params.batch_size <= params.max_tree_size
+    
+    # Run loop
+    key, tree, tree_len = \
+        jax.lax.while_loop(cond, step, (key, tree, tree_len))
+        
+    return key, tree, tree_len
+
 def init_tree(params, start_state):
     # Tree is [max_tree_size, state_dim + 1]
     # Which holds [:, state + parent_index]
@@ -256,15 +349,15 @@ if __name__ == "__main__":
 
     # FIXME we incur a penalty to copy this to gpu, in the
     # future star version we should call init_tree on gpu directly
-    tree, tree_len = init_tree(params, params.start)
+    tree, tree_len = init_tree(params, params.goal)
 
     # If not visualizing, then warmup for benchmark
     if not params.viewopt:
-        voronoi_kino(robot_module, vis_callback, params, key, tree, tree_len)
+        reverse_tree(robot_module, vis_callback, params, key, tree, tree_len)
         
     # Real shit
     start_time = time.perf_counter()
-    key, tree, tree_len = voronoi_kino(robot_module, vis_callback, params, key, tree, tree_len)
+    key, tree, tree_len = reverse_tree(robot_module, vis_callback, params, key, tree, tree_len)
     tree_len.block_until_ready()
     time_ms = (time.perf_counter() - start_time) * 1000
     print(f"Planning took {time_ms :.2f} ms")

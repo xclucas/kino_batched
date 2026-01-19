@@ -30,12 +30,15 @@ def forward(params, state, action, dt):
 
     return jnp.concatenate([new_pos, new_vel])
 
-def collide(params, state):
+def collide(params, old_state, new_state):
     # state: (4,) [x, y, vx, vy]
-    pos = state[:DOFS]
+    old_pos = old_state[:DOFS]
+    new_pos = new_state[:DOFS]
     
     # Bounds check
-    bounds_coll = jnp.any((state < params.state_min) | (state > params.state_max))
+    # Only check new_state, as old_state is assumed valid from the last collide() check
+    # and the base case (start and goal state) are assumed valid
+    bounds_coll = jnp.any((new_state < params.state_min) | (new_state > params.state_max))
     
     # Obstacle check
     # params.obs_data is expected to be array of obstacles.
@@ -43,7 +46,7 @@ def collide(params, state):
     
     # check if point is inside any obstacle (broad phase valid means separated)
     # so if valid -> no collision
-    is_free = params.collide_fn(pos, params.obs_data)
+    is_free = params.collide_fn(old_pos, new_pos, params.obs_data)
     
     return bounds_coll | (~is_free)
 

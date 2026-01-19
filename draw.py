@@ -84,6 +84,6 @@ def draw_targets(targets, robot_module=None):
     vis["targets"].set_object(
         g.Points(
             g.PointsGeometry(pts.T.astype(np.float64)),
-            g.PointsMaterial(size=0.1, color=0xff0000)
+            g.PointsMaterial(size=0.05, color=0xff0000)
         )
     )
