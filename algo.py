@@ -180,8 +180,8 @@ def reverse_extend_one(robot, params, start_state, action, goal_state, key):
         delta = x_dot * params.dt
         new_state = state - delta
         
-        # Check collision for the segment (order shouldn't matter for static obs)
-        did_collide = robot.collide(params, new_state, state)
+        # Check collision for the segment 
+        did_collide = robot.collide(params, state, new_state)
         state = jnp.where(did_collide, state, new_state)
 
         # Update nearest
@@ -259,9 +259,6 @@ def forward_tree(robot, vis_callback, params, key, tree, tree_len):
         
         extend_many = jax.vmap(extend_one_multiple_actions, in_axes=(None, None, 0, 0, 0))
         new_states, new_actions, new_elapsed_steps = extend_many(robot, params, origin_states, targets, batch_keys)
-                
-        # Check collision again? extend_one already returns valid states (or start state).
-        # We assume extend_one logic ensures validity.
         
         # Add to tree
         add_idx = tree_len + jnp.arange(params.batch_size)
@@ -325,9 +322,6 @@ def reverse_tree(robot, vis_callback, params, key, tree, tree_len):
         # Use REVERSE extension
         extend_many = jax.vmap(reverse_extend_one_multiple_actions, in_axes=(None, None, 0, 0, 0))
         new_states, new_actions, new_elapsed_steps = extend_many(robot, params, origin_states, samples, batch_keys)
-                
-        # Check collision again? extend_one already returns valid states (or start state).
-        # We assume extend_one logic ensures validity.
         
         # Add to tree
         add_idx = tree_len + jnp.arange(params.batch_size)
@@ -397,22 +391,21 @@ if __name__ == "__main__":
         robot_module.draw_robot(vis, params.start, color=0x0000ff, name="start")
         robot_module.draw_robot(vis, params.goal, color=0xff0000, name="goal")
 
-
     def vis_callback(new_states, parent_states, actions, elapsed_steps, targets, tree_len, mode):
         draw.draw_edges(parent_states, new_states, actions, elapsed_steps, tree_len, mode, params, robot_module)
         draw.draw_targets(targets, robot_module)
 
     # FIXME we incur a penalty to copy this to gpu, in the
     # future star version we should call init_tree on gpu directly
-    tree, tree_len = init_tree(params, params.goal)
+    tree, tree_len = init_tree(params, params.start)
 
     # If not visualizing, then warmup for benchmark
     if not params.viewopt:
-        reverse_tree(robot_module, vis_callback, params, key, tree, tree_len)
+        forward_tree(robot_module, vis_callback, params, key, tree, tree_len)
         
     # Real shit
     start_time = time.perf_counter()
-    key, tree, tree_len = reverse_tree(robot_module, vis_callback, params, key, tree, tree_len)
+    key, tree, tree_len = forward_tree(robot_module, vis_callback, params, key, tree, tree_len)
     tree_len.block_until_ready()
     time_ms = (time.perf_counter() - start_time) * 1000
     print(f"Planning took {time_ms :.2f} ms")

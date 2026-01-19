@@ -57,8 +57,9 @@ def draw_edges(parent_states, new_states, actions, elapsed_steps, tree_len_start
     traj_points.append(current_state[:, :3])
 
     if mode == "forward":
+        forward_batch = jax.vmap(robot_module.forward, in_axes=(None, 0, 0, None))
         for _ in range(params.sim_steps):
-            current_state = robot_module.forward(params, current_state, actions, params.dt)
+            current_state = forward_batch(params, current_state, actions, params.dt)
             traj_points.append(current_state[:, :3])
             
     elif mode == "reverse":
