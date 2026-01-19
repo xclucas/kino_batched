@@ -8,19 +8,13 @@ from matplotlib import pyplot as plt
 import numpy as np
 
 import env
-from robot import forward, metric_batch, sample, metric
+from robots.point_mass import forward, sample, metric, collide
 import argparse
 
 class Params:
-    def __init__(self, dt=0.7):
-        self.dt = dt
+    def __init__(self):
+        self.dt = 0.7
         self.dofs = 2
-        
-        self.pos_min = jnp.array([0, 0])
-        self.pos_max = jnp.array([50, 50])
-
-        self.action_min = jnp.array([-1, -1])
-        self.action_max = jnp.array([1, 1])
         
         self.obs_data = None
 
@@ -37,52 +31,6 @@ class Params:
         # Debug visualization
         self.viewopt = False
 
-def get_closest_k_edges(poses, poses_size, targets, k):
-    '''
-    Given 2 sets of positions: poses and targets
-    Get the k closest EDGES in the full bipartite graph
-    Returns k closest poses and their k corresponding targets
-    '''
-    assert poses.shape[-1] == targets.shape[-1], f"Dimension mismatch {poses.shape} {targets.shape}"
-    
-    valid_poses = jnp.arange(poses.shape[0]) < poses_size
-    
-    # (targets size, poses size)
-    edge_lens = metric_batch(targets[:, None, :], poses[None, :, :])
-    
-    # Mask out invalid targets and poses
-    edge_lens = jnp.where(valid_poses[None, :], edge_lens, jnp.inf)
-    # edge_lens = jnp.where(valid_targets[:, None], edge_lens, jnp.inf)
-
-    # Use top_k to get the smallest differences. top_k finds largest, so we negate.
-    flat_edge_lens = edge_lens.flatten()
-    _, flat_indices = jax.lax.top_k(-flat_edge_lens, k=k)
-    
-    target_indices, pose_indices = jnp.unravel_index(flat_indices, edge_lens.shape)
-    
-    return pose_indices, target_indices
-
-def get_k_noncolliding_targets(params, targets, k):
-    '''
-    From a set of targets, get at most k noncolliding,
-    if there are not enough, return as many as possible and then
-    random colliding ones
-    '''
-    valid_mask = jax.vmap(lambda pos: ~collide(params, pos))(targets)
-    
-    # Get min k valid targets
-    _, idx = jax.lax.top_k(valid_mask, k)
-    
-    return idx
-
-def collide(params, pos):
-    # Collision check with [x, y, x2, y2]
-    x, y, x2, y2 = params.obs_data.T
-    box_coll = jnp.any((pos[0] >= x) & (pos[0] <= x2) & (pos[1] >= y) & (pos[1] <= y2))
-    bounds_coll = jnp.any((pos < params.pos_min) | (pos > params.pos_max))
-    return box_coll | bounds_coll
-
-
 def extend_one(params, start_state, action, goal_state, key):
     '''
     Extend one state by one random action, for N steps
@@ -92,12 +40,10 @@ def extend_one(params, start_state, action, goal_state, key):
         '''Extend one state for one step, tracking closest so far'''
         
         state, nearest_distance, nearest_state, key = val
-        pos = state[:params.dofs]
-        vel = state[params.dofs:]
-        
+
         step_key, key = jax.random.split(key)
-        new_pose, new_vel = forward(params, pos, vel, action, step_key)
-        new_state = jnp.concatenate([new_pose, new_vel])
+        new_state = forward(params, state, action, params.dt)
+        new_pose = new_state[:params.dofs]
         
         # Update pos
         did_collide = collide(params, new_pose)
@@ -119,12 +65,13 @@ def extend_one(params, start_state, action, goal_state, key):
         
     return nearest_distance, nearest_state
 
-def extend_one_multiple_actions(params, start_state, actions, goal_state, key):
+def extend_one_multiple_actions(params, start_state, goal_state, key):
     '''
     Extend one state by many random actions, for N steps per action
     returns the single state closest to the goal
     '''
-    keys = jax.random.split(key, actions.shape[0])
+    actions = jax.random.uniform(key, (params.num_sample_actions, params.dofs), minval=params.action_min, maxval=params.action_max)
+    keys = jax.random.split(key, params.num_sample_actions)
     extend_one_vmap = jax.vmap(extend_one, in_axes=(None, None, 0, None, 0))
     closest_distances, closest_states = extend_one_vmap(params, start_state, actions, goal_state, keys)
         
@@ -157,7 +104,7 @@ def voronoi_kino(params, key, tree, tree_len):
         # # Which tree nodes to try to extend? And what targets to extend to?
         
         # Get closest tree node for each target
-        distances = metric_batch(targets[:, None, :], tree[None, :, :dofs2])
+        distances = metric(targets[:, None, :], tree[None, :, :dofs2])
         tree_valid = jnp.arange(tree.shape[0]) < tree_len
         distances = jnp.where(tree_valid, distances, jnp.inf)
         
@@ -171,11 +118,10 @@ def voronoi_kino(params, key, tree, tree_len):
         # target_poses = targets[target_indices]
        
         # Actions for EACH node
-        actions = jax.random.uniform(action_key, (params.num_sample_actions, params.dofs), minval=params.action_min, maxval=params.action_max)
         
         batch_keys = jax.random.split(extend_key, extend_states.shape[0])
-        extend_many = jax.vmap(extend_one_multiple_actions, in_axes=(None, 0, None, 0, 0))
-        closest_states = extend_many(params, extend_states, actions, target_poses, batch_keys)
+        extend_many = jax.vmap(extend_one_multiple_actions, in_axes=(None, 0, 0, 0))
+        closest_states = extend_many(params, extend_states, target_poses, batch_keys)
                 
         # Add to tree (closest_poses and closest_vels)
         add_idx = tree_len + jnp.arange(closest_states.shape[0])
