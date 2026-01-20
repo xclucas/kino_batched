@@ -266,12 +266,14 @@ def forward_tree(robot, vis_callback, params, key, tree, tree_len):
         new_states, new_actions, new_elapsed_steps = extend_many(robot, params, origin_states, samples, batch_keys)
         
         # Add to tree
-        add_idx = tree_len + jnp.arange(params.batch_size)
-                
-        tree = tree.at[add_idx, :state_dim].set(new_states)
-        tree = tree.at[add_idx, state_dim:state_dim+params.action_dim].set(new_actions)
-        tree = tree.at[add_idx, state_dim+params.action_dim].set(new_elapsed_steps)
-        tree = tree.at[add_idx, -1].set(pose_indices)
+        update_block = jnp.concatenate([
+            new_states,
+            new_actions,
+            new_elapsed_steps[:, None],
+            pose_indices[:, None]
+        ], axis=1)
+        
+        tree = jax.lax.dynamic_update_slice(tree, update_block, (tree_len, 0))
         
         if params.viewopt:
             # Extract parent states for visualization
@@ -336,12 +338,14 @@ def reverse_tree(robot, vis_callback, params, key, tree, tree_len):
         new_states, new_actions, new_elapsed_steps = extend_many(robot, params, origin_states, samples, batch_keys)
         
         # Add to tree
-        add_idx = tree_len + jnp.arange(params.batch_size)
-                
-        tree = tree.at[add_idx, :state_dim].set(new_states)
-        tree = tree.at[add_idx, state_dim:state_dim+params.action_dim].set(new_actions)
-        tree = tree.at[add_idx, state_dim+params.action_dim].set(new_elapsed_steps)
-        tree = tree.at[add_idx, -1].set(pose_indices)
+        update_block = jnp.concatenate([
+            new_states,
+            new_actions,
+            new_elapsed_steps[:, None],
+            pose_indices[:, None]
+        ], axis=1)
+        
+        tree = jax.lax.dynamic_update_slice(tree, update_block, (tree_len, 0))
         
         if params.viewopt:
             # Extract parent states for visualization
