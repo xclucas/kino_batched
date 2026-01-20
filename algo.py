@@ -58,11 +58,10 @@ class Params:
         self.num_sample_actions = 100 # Can be a large as fits in GPU lane
         self.sim_steps = 10 # Steps per extension
         
-        # Reverse tree extensions need to be this close to count
-        self.reverse_distance_threshold = 0.5
         # If we sample far away, we clamp the sample to this distance for the extension attempt
-        self.max_sample_from_distance = 2.0
-
+        self.max_sample_from_distance = 1.0
+        
+        # Visualize as we extend
         self.viewopt = False
         
         self.dofs = robot_module.DOFS
@@ -237,15 +236,15 @@ def forward_tree(robot, vis_callback, params, key, tree, tree_len):
         key, sample_key, extend_key = jax.random.split(key, 3)
         
         # Sample targets
-        targets = sample(params, sample_key, params.batch_size)
+        samples = sample(params, sample_key, params.batch_size)
         
-        # Get closest tree node for each target
+        # Get closest tree node for each sample
         # tree: [MAX, state_dim + 1]
         tree_states = tree[:, :state_dim]
         
-        # Vectorized metric: targets(B, S), tree(T, S)
+        # Vectorized metric: samples(B, S), tree(T, S)
         # Broadcast: (B, 1, S), (1, T, S)
-        distances = robot.metric(targets[:, None, :], tree_states[None, :, :])
+        distances = robot.metric(samples[:, None, :], tree_states[None, :, :])
         
         # Mask invalid tree nodes
         tree_valid = jnp.arange(tree.shape[0]) < tree_len
@@ -253,24 +252,31 @@ def forward_tree(robot, vis_callback, params, key, tree, tree_len):
         
         pose_indices = jnp.argmin(distances, axis=1) # (B,) indices of closest tree nodes
         origin_states = tree[pose_indices, :state_dim]
+
+        # Clamp samples
+        # TODO keep or no
+        dists_to_origin = jnp.min(distances, axis=1)
+        how_much_too_far = jnp.maximum(1.0, dists_to_origin / (params.max_sample_from_distance + 1e-6))
+        samples = origin_states + (samples - origin_states) / how_much_too_far[:, None]
         
         # Actions for EACH node
         batch_keys = jax.random.split(extend_key, params.batch_size)
         
         extend_many = jax.vmap(extend_one_multiple_actions, in_axes=(None, None, 0, 0, 0))
-        new_states, new_actions, new_elapsed_steps = extend_many(robot, params, origin_states, targets, batch_keys)
+        new_states, new_actions, new_elapsed_steps = extend_many(robot, params, origin_states, samples, batch_keys)
         
         # Add to tree
         add_idx = tree_len + jnp.arange(params.batch_size)
                 
         tree = tree.at[add_idx, :state_dim].set(new_states)
         tree = tree.at[add_idx, state_dim:state_dim+params.action_dim].set(new_actions)
+        tree = tree.at[add_idx, state_dim+params.action_dim].set(new_elapsed_steps)
         tree = tree.at[add_idx, -1].set(pose_indices)
         
         if params.viewopt:
             # Extract parent states for visualization
             parent_states = tree[pose_indices, :state_dim]
-            jax.debug.callback(vis_callback, new_states, parent_states, new_actions, new_elapsed_steps, targets, tree_len, "forward")
+            jax.debug.callback(vis_callback, new_states, parent_states, new_actions, new_elapsed_steps, samples, tree_len, "forward")
         
         tree_len += params.batch_size
 
@@ -316,6 +322,12 @@ def reverse_tree(robot, vis_callback, params, key, tree, tree_len):
         pose_indices = jnp.argmin(distances, axis=1) # (B,) indices of closest tree nodes
         origin_states = tree[pose_indices, :state_dim]
         
+        # Clamp samples
+        # TODO keep or no
+        dists_to_origin = jnp.min(distances, axis=1)
+        how_much_too_far = jnp.maximum(1.0, dists_to_origin / (params.max_sample_from_distance + 1e-6))
+        samples = origin_states + (samples - origin_states) / how_much_too_far[:, None]
+        
         # Actions for EACH node
         batch_keys = jax.random.split(extend_key, params.batch_size)
         
@@ -327,7 +339,8 @@ def reverse_tree(robot, vis_callback, params, key, tree, tree_len):
         add_idx = tree_len + jnp.arange(params.batch_size)
                 
         tree = tree.at[add_idx, :state_dim].set(new_states)
-        tree = tree.at[add_idx, state_dim:state_dim+params.action_dim].set(new_actions) # Store actions
+        tree = tree.at[add_idx, state_dim:state_dim+params.action_dim].set(new_actions)
+        tree = tree.at[add_idx, state_dim+params.action_dim].set(new_elapsed_steps)
         tree = tree.at[add_idx, -1].set(pose_indices)
         
         if params.viewopt:
@@ -350,9 +363,9 @@ def reverse_tree(robot, vis_callback, params, key, tree, tree_len):
     return key, tree, tree_len
 
 def init_tree(params, start_state):
-    # Tree is [max_tree_size, state_dim + action_dim + 1]
-    # Which holds [:, state + action + parent_index]
-    tree = jnp.zeros((params.max_tree_size, params.state_dim + params.action_dim + 1))
+    # Tree is [max_tree_size, state_dim + action_dim + 1 + 1]
+    # Which holds [:, state + action + elapsed_steps + parent_index]
+    tree = jnp.zeros((params.max_tree_size, params.state_dim + params.action_dim + 1 + 1))
     tree_len = 0
     
     tree = tree.at[0, :params.state_dim].set(start_state)
@@ -362,10 +375,6 @@ def init_tree(params, start_state):
     return tree, tree_len
 
 if __name__ == "__main__":
-    # Override matplotlib siginal handler to ctrl + c
-    import signal
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
-    
     parser = argparse.ArgumentParser()
     parser.add_argument('--robot', type=str, default='point_mass', choices=ROBOTS.keys())
     parser.add_argument('--scene', type=str, default='house', help="house, trees, narrowPassage")
@@ -378,22 +387,22 @@ if __name__ == "__main__":
     
     key = jax.random.key(time.time_ns())
     
-    print(f"Running {args.robot} in scene {args.scene}")
-    print(f"Start State: {params.start}")
-    print(f"Goal State: {params.goal}")
-    print(f"State Min {params.state_min}\n      Max: {params.state_max}")
+    # print(f"Running {args.robot} in scene {args.scene}")
+    # print(f"Start State: {params.start}")
+    # print(f"Goal State: {params.goal}")
+    # print(f"State Min {params.state_min}\n      Max: {params.state_max}")
     
     # Draw env
-    if args.viewopt:
-        vis = draw.init_vis()
-        draw.draw_obstacles(params.obs_data)
-        
-        robot_module.draw_robot(vis, params.start, color=0x0000ff, name="start")
-        robot_module.draw_robot(vis, params.goal, color=0xff0000, name="goal")
+    vis = draw.init_vis()
+    draw.draw_obstacles(params.obs_data)
+    
+    robot_module.draw_robot(vis, params.start, color=0x0000ff, name="start")
+    robot_module.draw_robot(vis, params.goal, color=0xff0000, name="goal")
 
     def vis_callback(new_states, parent_states, actions, elapsed_steps, targets, tree_len, mode):
         draw.draw_edges(parent_states, new_states, actions, elapsed_steps, tree_len, mode, params, robot_module)
         draw.draw_targets(targets, robot_module)
+        time.sleep(0.3)
 
     # FIXME we incur a penalty to copy this to gpu, in the
     # future star version we should call init_tree on gpu directly
@@ -408,5 +417,20 @@ if __name__ == "__main__":
     key, tree, tree_len = forward_tree(robot_module, vis_callback, params, key, tree, tree_len)
     tree_len.block_until_ready()
     time_ms = (time.perf_counter() - start_time) * 1000
-    print(f"Planning took {time_ms :.2f} ms")
+    
+    if not params.viewopt:
+        print(f"Planning took {time_ms :.2f} ms")
+        
     print(f"Final tree size: {tree_len} / {params.max_tree_size}")
+
+    # Extract information from tree
+    valid_tree = tree[:tree_len]
+    parent_indices = valid_tree[:, -1].astype(jnp.int32)
+    parent_states = valid_tree[parent_indices, :params.state_dim]
+    new_states = valid_tree[:, :params.state_dim]
+    actions = valid_tree[:, params.state_dim:params.state_dim+params.action_dim]
+    elapsed_steps = valid_tree[:, params.state_dim+params.action_dim]    
+    targets = jnp.zeros_like(new_states) # Not available here
+    
+    vis_callback(new_states, parent_states, actions, elapsed_steps, targets, tree_len, "forward")
+
