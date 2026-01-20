@@ -55,11 +55,11 @@ class Params:
         self.max_tree_size = 500
         
         # How many actions to sample when extending ONE node
-        self.num_sample_actions = 100 # Can be a large as fits in GPU lane
-        self.sim_steps = 10 # Steps per extension
+        self.num_sample_actions = 50 # Can be a large as fits in GPU lane
+        self.sim_steps = 15 # Steps per extension
         
-        # If we sample far away, we clamp the sample to this distance for the extension attempt
-        self.max_sample_from_distance = 1.0
+        # The sample is clamped to be at most this far from the tree
+        self.max_sample_from_distance = jnp.inf
         
         # Visualize as we extend
         self.viewopt = False
@@ -378,7 +378,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--robot', type=str, default='point_mass', choices=ROBOTS.keys())
     parser.add_argument('--scene', type=str, default='house', help="house, trees, narrowPassage")
-    parser.add_argument('--viewopt', action='store_true')
+    parser.add_argument('--viewopt', action='store_true', help="View the tree as it is built")
     args = parser.parse_args()
     
     robot_module = ROBOTS[args.robot]
@@ -432,5 +432,5 @@ if __name__ == "__main__":
     elapsed_steps = valid_tree[:, params.state_dim+params.action_dim]    
     targets = jnp.zeros_like(new_states) # Not available here
     
-    vis_callback(new_states, parent_states, actions, elapsed_steps, targets, tree_len, "forward")
+    draw.draw_edges(parent_states, new_states, actions, elapsed_steps, tree_len, "forward", params, robot_module)
 
